@@ -1,0 +1,3 @@
+backend/.env
+backend/api_service/.env
+.streamlit/secrets.toml
