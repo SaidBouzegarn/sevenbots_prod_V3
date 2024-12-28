@@ -11,12 +11,20 @@ async def extract_content(page, output_type="full_html"):
     Extract different types of content from the page based on specified types.
     
     """
+    await page.wait_for_load_state('networkidle')
+    await page.wait_for_load_state('domcontentloaded')
 
-    await page.wait_for_selector('a[href]')
+
+            
     # Extract links if requested
     if output_type == 'links':
         # Wait for the page to fully load (ensure all resources are loaded)
-        await page.wait_for_load_state('networkidle')
+            # Increase timeout and add state checks
+        try:
+            await page.wait_for_selector('a[href]', timeout=60000, state='attached')
+        except Exception as e:
+            logger.warning(f"No links found on page, continuing anyway: {e}")
+        
         base_url = page.url
 
         parsed_base_url = urlparse(base_url)

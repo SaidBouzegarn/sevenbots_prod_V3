@@ -1,76 +1,92 @@
 import streamlit as st
-import aiohttp
-import asyncio
+import requests
 import pandas as pd
 import json
+import logging
 
-async def fetch_available_tables():
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+def fetch_available_tables():
     """
-    Fetch available tables (adapted to match /db/tables endpoint with GET).
+    Fetch available tables from the backend.
     """
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get("http://localhost:8000/db/tables") as response:
-                response.raise_for_status()
-                return await response.json()  # Returns a list of table names
+        response = requests.get("http://localhost:8000/db/tables")
+        if response.status_code == 200:
+            return response.json()  # Returns a list of table names
+        else:
+            st.error(f"Failed to fetch tables: {response.text}")
+            return []
     except Exception as e:
         st.error(f"Error fetching tables: {e}")
         return []
 
-async def fetch_table_data(table_name, conditions=None):
+def fetch_table_data(table_name, conditions=None):
     """
-    Fetch table data by POSTing to /db/query/{table_name}
-    using json=payload (like test_query_table in db_service_test.py).
+    Fetch table data using POST request to /db/query/{table_name}
     """
     try:
+        # Ensure user is logged in
+        if not st.session_state.get("username_id"):
+            st.warning("Please log in to view database")
+            return {"rows": [], "total_count": 0}
+
+        # Prepare payload
         payload = {
-            "conditions": conditions or {}
+            "conditions": conditions or {},
+            # Optionally add user_id condition if needed
+            # "conditions": {"user_id": st.session_state.username_id}
         }
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"http://localhost:8000/db/query/{table_name}",
-                json=payload
-            ) as response:
-                response.raise_for_status()
-                data = await response.json()
-                # The /db/query endpoint returns a list of rows.
-                return {
-                    "rows": data,
-                    "total_count": len(data)
-                }
-    except aiohttp.ClientResponseError as e:
-        st.error(f"Network error fetching table data: {e}")
-        try:
-            error_text = await e.text()
-            st.error(f"Response content: {error_text or 'No response text'}")
-        except:
-            pass
-        return {"rows": [], "total_count": 0}
-    except ValueError as e:
-        st.error(f"JSON parsing error: {e}")
+
+        # Make the API request
+        response = requests.post(
+            f"{st.secrets.get('API_BASE_URL', 'http://localhost:8000')}/db/query/{table_name}", 
+            json=payload
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            return {
+                "rows": data,
+                "total_count": len(data)
+            }
+        else:
+            st.error(f"Failed to fetch table data: {response.text}")
+            return {"rows": [], "total_count": 0}
+    
+    except Exception as e:
+        st.error(f"Error fetching table data: {e}")
         return {"rows": [], "total_count": 0}
 
-async def update_table_data(table_name, rows):
+def update_table_data(table_name, rows):
     """
-    Post new/updated rows to /db/add_rows/{table_name}.
-    Per test_add_rows_endpoint in db_service_test.py, we send content=json.dumps(...).
+    Update or add rows to a table
     """
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"http://localhost:8000/db/add_rows/{table_name}",
-                content=json.dumps(rows),
-                headers={"Content-Type": "application/json"}
-            ) as response:
-                if response.status == 200:
-                    return await response.json()  # e.g., {"status": "success"}
-                else:
-                    detail = await response.json()
-                    return {
-                        "status": "error",
-                        "detail": detail
-                    }
-    except aiohttp.ClientError as e:
+        # Ensure user is logged in
+        if not st.session_state.get("username_id"):
+            st.warning("Please log in to update database")
+            return {"status": "error", "detail": "Not logged in"}
+
+        # Determine the appropriate endpoint based on the action
+        api_url = f"{st.secrets.get('API_BASE_URL', 'http://localhost:8000')}/db/add_rows/{table_name}"
+        
+        # Make the API request
+        response = requests.post(
+            api_url, 
+            json=rows
+        )
+        
+        if response.status_code == 200:
+            return {"status": "success"}
+        else:
+            return {
+                "status": "error",
+                "detail": response.text
+            }
+    
+    except Exception as e:
         return {
             "status": "error",
             "detail": str(e)
@@ -112,16 +128,21 @@ def render_databases_page():
         </style>
     """, unsafe_allow_html=True)
 
-    # Add info box about news_scrapper.db
+    # Ensure user is logged in
+    if not st.session_state.get("username_id"):
+        st.warning("Please log in to access Database Manager")
+        return
+
+    # Add info box about database
     st.markdown("""
         <div class="info-box">
-        This page allows you to view and edit the news scrapper database tables. 
-        The database contains information about scraped articles and website configurations.
+        This page allows you to view and edit database tables. 
+        Be cautious when making changes as they directly affect the database.
         </div>
     """, unsafe_allow_html=True)
 
-    # Fetch available tables asynchronously
-    tables = asyncio.run(fetch_available_tables())
+    # Fetch available tables
+    tables = fetch_available_tables()
     if not tables:
         st.warning("No tables found")
         return
@@ -129,8 +150,8 @@ def render_databases_page():
     # Table selection
     selected_table = st.selectbox("Select Table", options=tables)
 
-    # Fetch and display data asynchronously
-    result = asyncio.run(fetch_table_data(selected_table))
+    # Fetch and display data
+    result = fetch_table_data(selected_table)
     if not result['rows']:
         st.warning("No data found")
         return
@@ -147,12 +168,16 @@ def render_databases_page():
 
     # Save changes button
     if st.button("Save Changes"):
+        # Convert edited DataFrame to list of dictionaries
         rows_to_update = edited_df.to_dict('records')
-        # Update via backend asynchronously
-        update_result = asyncio.run(update_table_data(selected_table, rows_to_update))
+        
+        # Update via backend
+        update_result = update_table_data(selected_table, rows_to_update)
         
         if update_result.get('status') == 'success':
             st.success("Successfully added/updated rows!")
+            # Refresh the data
+            st.rerun()
         else:
             error_msg = update_result.get('detail', 'Failed to update rows')
             st.error(f"Update failed: {error_msg}")

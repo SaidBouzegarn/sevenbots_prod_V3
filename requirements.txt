@@ -57,3 +57,5 @@ pytest
 pytest-asyncio
 rq 
 redis
+tiktoken
+langgraph-checkpoint-postgres

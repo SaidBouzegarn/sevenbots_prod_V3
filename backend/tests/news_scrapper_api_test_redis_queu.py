@@ -22,7 +22,7 @@ async def test_news_scraper_api():
         "username": "Anas.abdoun@gmail.com",
         "password": "Kolxw007",
         "crawl": True,
-        "max_pages": 3
+        "max_pages": 10
     }
 
     async with httpx.AsyncClient(timeout=300.0) as client:

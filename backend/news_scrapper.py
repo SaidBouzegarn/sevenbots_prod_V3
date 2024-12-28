@@ -13,7 +13,7 @@ from playwright.async_api import async_playwright
 from playwright_stealth import stealth_async
 import os
 from backend.utils.utils import extract_content, clean_html_for_login_detection
-from backend.utils.llm_utils import select_likely_URLS, detect_login_url, detect_selectors, classify_and_extract_news_article
+from backend.utils.llm_utils import select_likely_URLS, detect_login_url, detect_selectors, classify_and_extract_news_article, is_article_relevant, filter_relevant_links
 from datetime import datetime
 from collections import deque
 from urllib.parse import urlparse
@@ -97,38 +97,77 @@ class NewsScrapper:
 
     async def initialize(self):
         """
-        Async initialization method to set up Playwright browser
+        Async initialization method to set up Playwright browser with enhanced stealth
         """
         self.playwright = await async_playwright().start()
+        
+        # Enhanced browser arguments for better stealth
+        browser_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+            "--disable-extensions",
+            "--disable-gpu",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-setuid-sandbox",
+            # Add these new arguments
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--disable-site-isolation-trials",
+            "--disable-web-security",
+            "--disable-features=ScriptStreaming",
+            "--window-size=1920,1080",
+        ]
+
         self.browser = await self.playwright.chromium.launch(
             headless=self.headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
-                "--disable-extensions",
-                "--disable-gpu",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-setuid-sandbox",
-            ],
+            args=browser_args
         )
 
-        # Create a new context with stealth settings
+        # Enhanced context settings
         self.context = await self.browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-                       "AppleWebKit/537.36 (KHTML, like Gecko) " +
-                       "Chrome/96.0.4664.45 Safari/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080},
             locale="en-US",
+            timezone_id="Europe/London",
+            geolocation={"latitude": 51.5074, "longitude": -0.1278},
+            permissions=["geolocation"],
+            java_script_enabled=True,
+            has_touch=True,
+            is_mobile=False,
+            device_scale_factor=1,
         )
 
-        # Open a new page and navigate to the website
+        # Add additional headers
+        await self.context.set_extra_http_headers({
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+        })
+        
+
         self.page = await self.context.new_page()
         await self.page.goto(self.website_url)
-        await self.page.wait_for_load_state('networkidle')
         
         # Apply stealth techniques
+        # Apply enhanced stealth techniques
         await stealth_async(self.page)
+        
+        # Add additional evasions
+        await self.page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => false,
+            });
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5],
+            });
+        """)
+        await self.page.wait_for_load_state('networkidle')
 
         # Check authentication requirements and login if needed
         if await self._can_authenticate():
@@ -173,15 +212,16 @@ class NewsScrapper:
             await self.context.add_cookies(self.session_cookies)
         
         responses = []
-        await asyncio.sleep(random.uniform(1, 10))
         await self.page.goto(self.website_url)
         await self.page.wait_for_load_state('networkidle')  # Wait for the page to be fully loaded
-        
+        await asyncio.sleep(random.uniform(1, 3))
+
         urls = await extract_content(self.page, output_type="links")
         logger.info(f"found links {(urls)} ")
         
         # Check if the specific prompt exists
         articles_links_prompt_template = self.prompts.get('articles_links_prompt')
+
         # Create Jinja2 template from the prompt text
         template = Template(articles_links_prompt_template)
         
@@ -192,9 +232,11 @@ class NewsScrapper:
         
         # Use the rendered prompt with your existing function
         response = await select_likely_URLS(prompt)
-
+        r = await self.add_responses(llm_function="select_likely_URLS", responses=(str(json.dumps(urls)), str(response.model_dump())))
         lucky_urls = response.likely_urls
         url_list = [link['href'] for link in urls]
+
+
 
         # Filter lucky_urls to only include URLs that exist in 'urls'
         if isinstance(lucky_urls, list):
@@ -205,6 +247,16 @@ class NewsScrapper:
         logger.info(f"found {len(n_lucky_urls)} new urls")
         logger.info(f"llm hallucinated {len(lucky_urls) - len(n_lucky_urls)} urls")
         
+        filter_prompt = self.prompts.get('select_relevant_link')
+        template = Template(str(filter_prompt))
+        prompt = template.render(
+            urls=n_lucky_urls
+        )
+        response = await filter_relevant_links(prompt)
+        r = await self.add_responses(llm_function="filter_relevant_links", responses=(str(json.dumps(n_lucky_urls)), str(response.model_dump())))
+        n_lucky_urls = response.relevant_urls
+
+        logger.info(f"filtered {len(n_lucky_urls)} relevant urls")  
         # Initialize deque for efficient popping from the left
         to_visit = deque()
         to_visit.extend(n_lucky_urls)
@@ -229,8 +281,8 @@ class NewsScrapper:
         responses.append((self.website_url, response.model_dump()))
         
         if not self.crawl: 
-            await self.add_visited_urls([(self.website_url, response.classification if response else None)])
-            return await self.add_responses(llm_function="classify_and_extract_news_article", responses=responses)
+            r=await self.add_visited_urls([(self.website_url, response.classification if response else None)])
+            return await self.add_responses(llm_function="classify_and_extract_news_article", responses=(str(json.dumps(responses)), str(response.model_dump())))
         
         newly_visited_urls = [(self.website_url, response.classification if response else None)]
 
@@ -242,7 +294,7 @@ class NewsScrapper:
                 continue
 
             # Add delay before each new page navigation
-            await asyncio.sleep(random.uniform(1, 10))
+            await asyncio.sleep(random.uniform(1, 5))
             await self.page.goto(current_url)
 
             try:
@@ -259,9 +311,24 @@ class NewsScrapper:
                     cleaned_html=structured_content
                 )
                 response = await classify_and_extract_news_article(prompt)
+                r= await self.add_responses(llm_function="classify_and_extract_news_article", responses=(str(prompt), str(response.model_dump() )))
+
                 if response: 
                     responses.append((current_url, response.model_dump()))
                 newly_visited_urls.append((current_url, response.classification if response else False))
+
+                if response.classification:
+                    prompt = self.prompts.get('is_article_relevant')
+                    template = Template(prompt)
+                    prompt = template.render(
+                        article=response.model_dump()
+                    )
+                    is_relevant = await is_article_relevant(prompt)
+                    if is_relevant:
+                        r = await self.add_responses(llm_function="is_article_relevant", responses=(str(response.model_dump()), str(is_relevant.model_dump())))
+                        print("is_relevant", r)
+                
+                newly_visited_urls.append((current_url, True))
             except Exception as e: 
                 logger.info(f"Warning: Could not classify and extract news article from {current_url}. Skipping... Full error:\n{traceback.format_exc()}")
             
@@ -276,6 +343,7 @@ class NewsScrapper:
             )
             try: 
                 response = await select_likely_URLS(prompt)
+                r = await self.add_responses(llm_function="select_likely_URLS", responses=(str(json.dumps(new_links)), str(response.model_dump())))
                 new_lucky_urls = response.likely_urls
 
                 # Filter new_lucky_urls to only include URLs that exist in 'new_links'
@@ -287,13 +355,19 @@ class NewsScrapper:
                 logger.info(f"found {len(n_lucky_urls)} new urls")
                 logger.info(f"llm hallucinated {len(new_lucky_urls) - len(n_lucky_urls)} urls")
 
-                to_visit.extend(n_lucky_urls)
+                filter_prompt = self.prompts.get('select_relevant_link')
+                template = Template(str(filter_prompt))
+                prompt = template.render(
+                    urls=n_lucky_urls
+                )
+                response = await filter_relevant_links(prompt)
+                r = await self.add_responses(llm_function="filter_relevant_links", responses=(str(json.dumps(n_lucky_urls)), str(response.model_dump() )))
+                to_visit.extend(response.relevant_urls)
             except Exception as e: 
                 logger.info(f"Warning: Could not select likely URLs from {current_url}. Full error:\n{traceback.format_exc()}")
 
         r = await self.add_visited_urls(newly_visited_urls)
         print("saving visited urls", r)
-        r= await self.add_responses(llm_function="classify_and_extract_news_article", responses=responses)
         return ( len(newly_visited_urls), len([response for response in responses if response[1].get('classification') == True]), len([response for response in responses if response[1].get('classification') == False]))
     async def close(self):
         """Async method to close browser and playwright"""
@@ -315,10 +389,10 @@ class NewsScrapper:
         if not self.login_url_ok:
             try: 
                 response = await self.get_login_url()
+                self.add_responses(llm_function="get_login_url", responses=(self.website_url, response.model_dump()))
                 if response.sucess:
                     self.login_url = response.login_url
                     self.login_url_ok = True
-                    self.add_responses(llm_function="get_login_url", responses=(self.website_url, response.model_dump()))
 
                 else:
                     logger.info(f"Warning: Could not determine login URL. Continuing without authentication...Full error:\n{traceback.format_exc()}")
@@ -326,19 +400,19 @@ class NewsScrapper:
             except Exception as e:
                 logger.info(f"Warning: Could not determine login URL. Continuing without authentication...Full error:\n{traceback.format_exc()}")
                 return False
-        if not self.login_url_ok:
-            logger.info(f"Warning: Login URL is not a string and its type is {type(self.login_url)}. Continuing without authentication...")
-            return False
         
+        #if login url is not ok, we can't get selectors
+        if not self.login_url_ok:
+            return False
         # Verify all required selectors are present
         if not self.username_selector_ok or not self.password_selector_ok or not self.submit_button_selector_ok:
             try:
                 # Detect login selectors
                 response = await self.get_login_selectors()
+                self.add_responses(llm_function="get_login_selectors", responses=(str(self.login_url), str(response.model_dump())))
                 if not response.sucess:  # Check if any selector is None or empty
-                    logger.info("Warning: One or more login selectors are empty or invalid")
+                    logger.info("Warning: could not get valid login selectors")
                     return False
-                self.add_responses(llm_function="get_login_selectors", responses=(self.login_url, response.model_dump()))
                 self.username_selector = response.username_selector
                 self.password_selector = response.password_selector
                 self.submit_button_selector = response.submit_button_selector
@@ -503,98 +577,6 @@ class NewsScrapper:
         except Exception as e:
             logger.info(f"Error extracting domain from {url}: {e}")
             return url  # Fallback to returning the original URL if parsing fails
-    
-    async def get_prompts_api(self):
-        """
-        Retrieve prompts from database for the specific domain
-        
-        Returns:
-            dict: A dictionary containing the most recent prompts
-        """
-        try:
-            # Prepare query conditions
-            conditions = {
-                "user_id": self.user_id,
-            }
-
-            # Use the new query_table endpoint
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    f"{BASE_URL}/db/query/scrapping_prompts", 
-                    json={
-                        "conditions": conditions,
-                        "order_by": [{"column": "time_stamp", "direction": "DESC"}],
-                        "limit": 1  # Only get the most recent row
-                    }
-                )
-            
-            # Check if the request was successful
-            if response.status_code != 200:
-                logger.info(f"Error querying prompts: {response.text}")
-                return {}
-
-            # Parse the response
-            results = response.json()
-            
-            # If no results, return empty dictionary
-            if not results:
-                logger.info(f"No prompts found for user {self.user_id}")
-                return {}
-
-            # Get the most recent prompts row
-            latest_prompts = results[0]
-            
-            # Return a dictionary with prompt templates
-            return {
-                'articles_links_prompt': latest_prompts.get('articles_links_prompt', ''),
-                'classification_extraction_prompt': latest_prompts.get('classification_extraction_prompt', ''),
-                'get_login_url_prompt': latest_prompts.get('get_login_url_prompt', ''),
-                'login_selectors_prompt': latest_prompts.get('login_selectors_prompt', '')
-            }
-            
-        except Exception as e:
-            logger.info(f"Error retrieving prompts: {e}")
-            raise e
-
-    async def add_responses_api(self, llm_function, responses):
-        """
-        Add LLM call responses to the database via API service
-        
-        Args:
-            llm_function (str): Name of the LLM function used
-            responses (list): List of tuples containing (prompt, response)
-        """
-        try:
-            # Prepare the data for insertion
-            data = [
-                {
-                    "user_id": self.user_id,
-                    "llm": llm_function,
-                    "prompt": str(prompt),
-                    "response": str(response),
-                    "time": str(datetime.now().isoformat())
-                } 
-                for prompt, response in responses
-            ]
-
-            # Use the new add_rows endpoint
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    f"{BASE_URL}/db/add_rows/llm_calls", 
-                    content=json.dumps(data),
-                    headers={"Content-Type": "application/json"}
-                )
-            
-            # Check if the request was successful
-            if response.status_code != 200:
-                logger.info(f"Error adding LLM responses: {response.text}")
-                return False
-
-            return True
-        
-        except Exception as e:
-            logger.info(f"Error adding LLM responses via API: {e}")
-            return False
 
     async def get_visited_urls(self):
         """
@@ -640,10 +622,12 @@ class NewsScrapper:
 
             # Return the most recent prompts
             return {
-                'articles_links_prompt': results[0].get('articles_links_prompt', ''),
-                'classification_extraction_prompt': results[0].get('classification_extraction_prompt', ''),
-                'get_login_url_prompt': results[0].get('get_login_url_prompt', ''),
-                'login_selectors_prompt': results[0].get('login_selectors_prompt', '')
+                'articles_links_prompt': str(results[0].get('articles_links_prompt', '')),
+                'classification_extraction_prompt': str(results[0].get('classification_extraction_prompt', '')),
+                'get_login_url_prompt': str(results[0].get('get_login_url_prompt', '')),
+                'login_selectors_prompt': str(results[0].get('login_selectors_prompt', '')),
+                'select_relevant_link': str(results[0].get('select_relevant_link', '')),
+                'is_article_relevant': str(results[0].get('is_article_relevant', ''))
             }
         except Exception as e:
             logger.info(f"Error retrieving prompts directly from database: {e}")
@@ -679,25 +663,31 @@ class NewsScrapper:
         
         Args:
             llm_function (str): Name of the LLM function used
-            responses (list): List of tuples containing (prompt, response)
+            responses (tuple or list): Flexible input handling
         """
-        try:
-            data = [
-                {
-                    "user_id": self.user_id,
-                    "llm": llm_function,
-                    "prompt": str(prompt),
-                    "response": str(response),
-                    "time": str(datetime.now().isoformat())
-                } 
-                for prompt, response in responses
-            ]
-            
-            await self.postgresmanager.add_rows("llm_calls", data)
-            return True
-        except Exception as e:
-            logger.info(f"Error adding LLM responses directly to database: {e}")
-            return False
+        # If responses is not a list, convert it to a list
+        if not isinstance(responses, list):
+            # Special handling for the specific case of (urls, response)
+            if len(responses) == 2:
+                responses = [(responses[0], responses[1])]
+            else:
+                responses = [responses]
+        
+        data = [
+            {
+                "user_id": self.user_id,
+                "llm": llm_function,
+                # Handle cases where the first item might be a list, JSON string, or other type
+                "prompt": str(prompt) if prompt is not None else '',
+                # Handle cases where the response might be a Pydantic model, dict, or other type
+                "response": str(response) if response is not None else '',
+                "time": str(datetime.now().isoformat())
+            } 
+            for prompt, response in responses
+        ]
+        
+        await self.postgresmanager.add_rows("llm_calls", data)
+        return True
 
 
 
