@@ -236,8 +236,6 @@ class NewsScrapper:
         lucky_urls = response.likely_urls
         url_list = [link['href'] for link in urls]
 
-
-
         # Filter lucky_urls to only include URLs that exist in 'urls'
         if isinstance(lucky_urls, list):
             n_lucky_urls = [url for url in lucky_urls if url in url_list]
@@ -254,12 +252,14 @@ class NewsScrapper:
         )
         response = await filter_relevant_links(prompt)
         r = await self.add_responses(llm_function="filter_relevant_links", responses=(str(json.dumps(n_lucky_urls)), str(response.model_dump())))
-        n_lucky_urls = response.relevant_urls
 
         logger.info(f"filtered {len(n_lucky_urls)} relevant urls")  
         # Initialize deque for efficient popping from the left
         to_visit = deque()
-        to_visit.extend(n_lucky_urls)
+        if response.relevant_urls and len(response.relevant_urls) > 0:
+            to_visit.extend(response.relevant_urls)
+        else:
+            to_visit.extend(n_lucky_urls)
 
         # Navigate to the target URL while staying logged in
         await self.page.wait_for_load_state('networkidle')  # Wait for the page to be fully loaded
@@ -286,7 +286,8 @@ class NewsScrapper:
         
         newly_visited_urls = [(self.website_url, response.classification if response else None)]
 
-        while to_visit and len(responses) < self.max_pages:
+        #while to_visit deque is not empty and len(newly_visited_urls) < self.max_pages:
+        while to_visit and len(newly_visited_urls) < self.max_pages:
             current_url = to_visit.popleft()
             logger.info(f"crawling url {current_url}")
             is_visited_url = await self.is_url_visited(current_url)
@@ -300,7 +301,7 @@ class NewsScrapper:
             try:
                 await self.page.wait_for_load_state('networkidle')  # Wait for the page to be fully loaded
 
-                html_content = await extract_content(self.page, output_type="formatted_text")
+                structured_content = await extract_content(self.page, output_type="formatted_text")
                 classification_prompt_template = self.prompts.get('classification_extraction_prompt')
                 
                 # Create Jinja2 template from the prompt text
@@ -328,7 +329,6 @@ class NewsScrapper:
                         r = await self.add_responses(llm_function="is_article_relevant", responses=(str(response.model_dump()), str(is_relevant.model_dump())))
                         print("is_relevant", r)
                 
-                newly_visited_urls.append((current_url, True))
             except Exception as e: 
                 logger.info(f"Warning: Could not classify and extract news article from {current_url}. Skipping... Full error:\n{traceback.format_exc()}")
             
@@ -341,30 +341,31 @@ class NewsScrapper:
             prompt = template.render(
                 urls=new_links
             )
-            try: 
-                response = await select_likely_URLS(prompt)
-                r = await self.add_responses(llm_function="select_likely_URLS", responses=(str(json.dumps(new_links)), str(response.model_dump())))
-                new_lucky_urls = response.likely_urls
+            response = await select_likely_URLS(prompt)
+            r = await self.add_responses(llm_function="select_likely_URLS", responses=(str(json.dumps(new_links)), str(response.model_dump())))
+            new_lucky_urls = response.likely_urls
 
-                # Filter new_lucky_urls to only include URLs that exist in 'new_links'
-                if isinstance(new_lucky_urls, list):
-                    n_lucky_urls = [url for url in new_lucky_urls if url in new_links]
-                else:
-                    n_lucky_urls = [new_lucky_urls] if new_lucky_urls in new_links else []
+            # Filter new_lucky_urls to only include URLs that exist in 'new_links'
+            if isinstance(new_lucky_urls, list):
+                n_lucky_urls = [url for url in new_lucky_urls if url in new_links]
+            else:
+                n_lucky_urls = [new_lucky_urls] if new_lucky_urls in new_links else []
 
-                logger.info(f"found {len(n_lucky_urls)} new urls")
-                logger.info(f"llm hallucinated {len(new_lucky_urls) - len(n_lucky_urls)} urls")
+            logger.info(f"found {len(n_lucky_urls)} new urls")
+            logger.info(f"llm hallucinated {len(new_lucky_urls) - len(n_lucky_urls)} urls")
 
-                filter_prompt = self.prompts.get('select_relevant_link')
-                template = Template(str(filter_prompt))
-                prompt = template.render(
-                    urls=n_lucky_urls
-                )
-                response = await filter_relevant_links(prompt)
-                r = await self.add_responses(llm_function="filter_relevant_links", responses=(str(json.dumps(n_lucky_urls)), str(response.model_dump() )))
-                to_visit.extend(response.relevant_urls)
-            except Exception as e: 
-                logger.info(f"Warning: Could not select likely URLs from {current_url}. Full error:\n{traceback.format_exc()}")
+            filter_prompt = self.prompts.get('select_relevant_link')
+            template = Template(str(filter_prompt))
+            prompt = template.render(
+                urls=n_lucky_urls
+            )
+            response = await filter_relevant_links(prompt)
+            logger.info(f"filtered {len(response.relevant_urls)} relevant urls")
+
+            r = await self.add_responses(llm_function="filter_relevant_links", responses=(str(json.dumps(n_lucky_urls)), str(response.model_dump() )))
+            if not response.relevant_urls or len(response.relevant_urls) == 0:
+                to_visit.extend(n_lucky_urls)
+            to_visit.extend(response.relevant_urls)
 
         r = await self.add_visited_urls(newly_visited_urls)
         print("saving visited urls", r)

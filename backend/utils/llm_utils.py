@@ -1,18 +1,70 @@
 from openai import AsyncOpenAI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import List
 from tenacity import retry, stop_after_attempt
 import os
 import asyncio
 import logging
 from functools import lru_cache
+from langchain_openai import ChatOpenAI
+from langchain_mistralai import ChatMistralAI
+from langchain_cohere import ChatCohere
+from langchain_groq import ChatGroq
+from langchain_anthropic import ChatAnthropic
+from langchain_nvidia_ai_endpoints import ChatNVIDIA
+from langchain_fireworks import ChatFireworks
+from langchain_community.chat_models import ChatOllama
+from langchain_core.tools import BaseTool
+from langchain_community.tools import DuckDuckGoSearchRun
+from typing import List, Optional, Dict, Any, Union, Callable, Sequence, TypedDict, Annotated, Literal, Type
+from langchain_core.language_models import BaseLanguageModel
+
+import tiktoken
+from .llm_models import (
+    OPENAI_MODELS,
+    MISTRAL_MODELS,
+    COHERE_MODELS,
+    GROQ_MODELS,
+    OLLAMA_MODELS,
+    NVIDIA_MODELS,
+    ANTHROPIC_MODELS,
+    FIREWORKS_MODELS,
+)
 
 import tiktoken
 
 logger = logging.getLogger(__name__)
 # Initialize logger
 
-openai_key = os.getenv('OPENAI_API_KEY')
+#### LLM Models ####
+#cach this function
+#@lru_cache(maxsize=10)
+async def get_llm(llm_name: str = "gpt-4o-mini", llm_params: Dict[str, Any] = {"temperature": 0.1618}, tools: List[BaseTool] = []) -> BaseLanguageModel:
+    """Construct the appropriate LLM based on the input string and parameters."""
+    if llm_name in OPENAI_MODELS:
+        llm = ChatOpenAI(model_name=llm_name, **llm_params)
+    elif llm_name in MISTRAL_MODELS:
+        llm = ChatMistralAI(model=llm_name, **llm_params)
+    elif llm_name in COHERE_MODELS:
+        llm = ChatCohere(model=llm_name, **llm_params)
+    elif llm_name in GROQ_MODELS:
+        llm = ChatGroq(model=llm_name, **llm_params)
+    elif llm_name in OLLAMA_MODELS:
+        llm = ChatOllama(model=llm_name, **llm_params)
+    elif llm_name in NVIDIA_MODELS:
+        llm = ChatNVIDIA(model=llm_name, **llm_params)
+    elif llm_name in ANTHROPIC_MODELS:
+        llm = ChatAnthropic(model=llm_name, **llm_params)
+    elif llm_name in FIREWORKS_MODELS:
+        llm = ChatFireworks(model=llm_name, **llm_params)
+    else:
+        raise ValueError(f"Unsupported model: {llm_name}")
+    
+    if tools:
+        return llm.bind_tools(tools)
+
+    return llm
+
 
 ############ Select likely URLs ############    
 
@@ -83,7 +135,7 @@ async def async_truncate_prompt(
         return prompt  # Fallback to original prompt
 
 @retry(stop=stop_after_attempt(3))
-async def select_likely_URLS(prompt):
+async def select_likely_URLS(prompt, llm_name: str = "gpt-4o-mini", llm_config: Dict[str, Any] = {"temperature": 0.1618}):
     """Detect good to go links from bad links."""
     try:
         logger.info("Starting URL selection process")
@@ -95,23 +147,17 @@ async def select_likely_URLS(prompt):
             model="gpt-4o-mini",
         )
         
-        # Use AsyncOpenAI client
-        client = AsyncOpenAI(api_key= openai_key)
+        # Construct LLM using get_llm with configuration
+        llm = await get_llm(llm_name, llm_config)
+        structured_llm = llm.with_structured_output(URLListResponse)
         
         logger.debug(f"Processing truncated prompt: {truncated_prompt[:100]}...")
         
-        completion = await client.beta.chat.completions.parse(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "you are an assistant that is tasked with selecting a list of URLs that meet the criteria for likely news articles the most and are not suspected bot traps nor user related nor categories webpages."},
-                {"role": "user", "content": truncated_prompt}
-            ],
-            response_format=URLListResponse,
-            timeout=60,
-            temperature=0.1618,
-        )
+        response = structured_llm.invoke([
+            {"role": "system", "content": "you are an assistant that is tasked with selecting a list of URLs that meet the criteria for likely news articles the most and are not suspected bot traps nor user related nor categories webpages."},
+            {"role": "user", "content": truncated_prompt}
+        ])
 
-        response = completion.choices[0].message.parsed
         logger.info(f"Successfully selected {len(response.likely_urls)} URLs")
         return response
         
@@ -126,7 +172,7 @@ class FormFieldLoginUrl(BaseModel):
     login_url: str
     comment: str
 @retry(stop=stop_after_attempt(3))
-async def detect_login_url(prompt):
+async def detect_login_url(prompt, llm_name: str = "gpt-4o-mini", llm_config: Dict[str, Any] = {"temperature": 0.1618}):
     try:
         logger.info("Starting login URL detection")
         
@@ -137,19 +183,14 @@ async def detect_login_url(prompt):
             model="gpt-4o",
         )
         
-        client = AsyncOpenAI(api_key=openai_key)
+        # Construct LLM using get_llm with configuration
+        llm = await get_llm(llm_name, llm_config)
+        structured_llm = llm.with_structured_output(FormFieldLoginUrl)
 
-        completion = await client.beta.chat.completions.parse(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "Detect login url in the a list of urls"},
-                {"role": "user", "content": truncated_prompt}
-            ],
-            response_format=FormFieldLoginUrl,
-            timeout=20,
-            temperature=0.1618,
-        )
-        response = completion.choices[0].message.parsed
+        response = structured_llm.invoke([
+            {"role": "system", "content": "Detect login url in the a list of urls"},
+            {"role": "user", "content": truncated_prompt}
+        ])
         logger.info(f"looking for login url in {truncated_prompt}")
         logger.info(f"Login URL detected: {response}")
         return response
@@ -168,7 +209,7 @@ class FormFieldInfoCredentials(BaseModel):
     comment: str
 
 @retry(stop=stop_after_attempt(3))
-async def detect_selectors(prompt):
+async def detect_selectors(prompt, llm_name: str = "gpt-4o-mini", llm_config: Dict[str, Any] = {"temperature": 0.1618}):
     try:
         logger.info("Starting CSS selector detection")
         
@@ -179,19 +220,14 @@ async def detect_selectors(prompt):
             model="gpt-4o",
         )
         
-        client = AsyncOpenAI(api_key=openai_key)
+        # Construct LLM using get_llm with configuration
+        llm = await get_llm(llm_name, llm_config)
+        structured_llm = llm.with_structured_output(FormFieldInfoCredentials)
 
-        completion = await client.beta.chat.completions.parse(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "Detect username field, password fields, and submit button css selectors in the cleaned HTML"},
-                {"role": "user", "content": truncated_prompt}
-            ],
-            response_format=FormFieldInfoCredentials,
-            timeout=20,
-            temperature=0.1618,
-        )
-        response = completion.choices[0].message.parsed
+        response = structured_llm.invoke([
+            {"role": "system", "content": "Detect username field, password fields, and submit button css selectors in the cleaned HTML"},
+            {"role": "user", "content": truncated_prompt}
+        ])
         logger.info(f"looking for css selectors in {truncated_prompt}")
         logger.info(f"CSS selectors detected successfully : {response}")
         logger.debug(f"Detected selectors: {response}")
@@ -212,7 +248,7 @@ class FormFieldNewsArticleExtractor(BaseModel):
     comment: str
 
 @retry(stop=stop_after_attempt(3))
-async def classify_and_extract_news_article(prompt):
+async def classify_and_extract_news_article(prompt, llm_name: str = "gpt-4o-mini", llm_config: Dict[str, Any] = {"temperature": 0.1618}):
     try:
         logger.info("Starting article classification and extraction")
         
@@ -223,20 +259,15 @@ async def classify_and_extract_news_article(prompt):
             model="gpt-4o-mini",
         )
         
-        client = AsyncOpenAI(api_key=openai_key)
+        # Construct LLM using get_llm with configuration
+        llm = await get_llm(llm_name, llm_config)
+        structured_llm = llm.with_structured_output(FormFieldNewsArticleExtractor)
 
-        completion = await client.beta.chat.completions.parse(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "you are an assistant that is tasked with classifying a webpage as either a 'full Article webpage' or 'Not an Article webpage' based on its cleaned HTML content and extracting the full article content when it is an article webpage."},
-                {"role": "user", "content": truncated_prompt}
-            ],
-            response_format=FormFieldNewsArticleExtractor,
-            timeout=60,
-            temperature=0.1618,
-        )
+        response = structured_llm.invoke([
+            {"role": "system", "content": "you are an assistant that is tasked with classifying a webpage as either a 'full Article webpage' or 'Not an Article webpage' based on its cleaned HTML content and extracting the full article content when it is an article webpage."},
+            {"role": "user", "content": truncated_prompt}
+        ])
 
-        response = completion.choices[0].message.parsed
         
         if response.classification:
             logger.info(f"Article extracted successfully: {response.title}")
@@ -256,7 +287,7 @@ class RelevantLinksResponse(BaseModel):
     relevant_urls: List[str]
 
 @retry(stop=stop_after_attempt(3))
-async def filter_relevant_links(prompt):
+async def filter_relevant_links(prompt, llm_name: str = "gpt-4o-mini", llm_config: Dict[str, Any] = {"temperature": 0.1618}):
     """
     Filter URLs to identify those relevant to healthcare or medical technology.
     
@@ -278,21 +309,15 @@ async def filter_relevant_links(prompt):
             model="gpt-4o-mini",
         )
         
-        # Use AsyncOpenAI client
-        client = AsyncOpenAI(api_key=openai_key)
+        # Construct LLM using get_llm with configuration
+        llm = await get_llm(llm_name, llm_config)
+        structured_llm = llm.with_structured_output(RelevantLinksResponse)
         
-        completion = await client.beta.chat.completions.parse(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are tasked with evaluating a list of URLs to identify those relevant to user interest."},
-                {"role": "user", "content": truncated_prompt}
-            ],
-            response_format=RelevantLinksResponse,
-            timeout=60,
-            temperature=0.1618,
-        )
+        response = structured_llm.invoke([
+            {"role": "system", "content": "You are tasked with evaluating a list of URLs to identify those relevant to user interest."},
+            {"role": "user", "content": truncated_prompt}
+        ])
 
-        response = completion.choices[0].message.parsed
         logger.info(f"Successfully filtered {len(response.relevant_urls)} relevant URLs")
         return response
         
@@ -307,7 +332,7 @@ class ArticleRelevanceResponse(BaseModel):
     relevance_reason: str
 
 @retry(stop=stop_after_attempt(3))
-async def is_article_relevant(prompt):
+async def is_article_relevant(prompt, llm_name: str = "gpt-4o-mini", llm_config: Dict[str, Any] = {"temperature": 0.1618}):
     """
     Determine if an article is relevant to healthcare or medical technology.
     
@@ -327,21 +352,15 @@ async def is_article_relevant(prompt):
             model="gpt-4o-mini",
         )
         
-        # Use AsyncOpenAI client
-        client = AsyncOpenAI(api_key=openai_key)
-        
-        completion = await client.beta.chat.completions.parse(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Evaluate the relevance of an article to user interest."},
-                {"role": "user", "content": truncated_prompt}
-            ],
-            response_format=ArticleRelevanceResponse,
-            timeout=60,
-            temperature=0.1618,
-        )
+        # Construct LLM using get_llm with configuration
+        llm = await get_llm(llm_name, llm_config)
+        structured_llm = llm.with_structured_output(ArticleRelevanceResponse)
 
-        response = completion.choices[0].message.parsed
+        response = structured_llm.invoke([
+            {"role": "system", "content": "Evaluate the relevance of an article to user interest."},
+            {"role": "user", "content": truncated_prompt}
+        ])
+
         logger.info(f"Article relevance assessment complete: {response.is_relevant}")
         return response
         
